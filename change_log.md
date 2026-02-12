@@ -1,0 +1,20 @@
+THIS CHANGE LOG LOGS THE LAST AI'S CHANGES IN THE CODE AND WHY THE CHANGES WERE MADE
+
+Title: Fix #1 — Eliminate DELETE→INSERT race condition in checkRateLimit()
+Why this edit was made:
+The previous implementation used a three-step pattern: (1) DELETE expired entries, (2) SELECT to check count, (3) INSERT...ON DUPLICATE KEY UPDATE to record the attempt. Under concurrent requests, the DELETE in one request could remove a record that another concurrent request's INSERT relied on for the UNIQUE constraint to trigger ON DUPLICATE KEY UPDATE. This caused sporadic duplicate key violations that crashed the request with an unhandled PDO exception.
+The fix collapses all logic into a single atomic upsert that uses IF() expressions to handle expired windows inline — resetting action_count to 1 and window_start to NOW() when the window has expired, or incrementing the count when it hasn't. The count check now happens after the upsert (using > instead of >= since the current attempt is already counted). Stale record cleanup is moved to a probabilistic 1%-per-request sweep with a 2x window buffer, ensuring it never interferes with active rate limiting.
+
+Title: Fix #2 — Resolve expired-session CSRF deadlock on logout + unify competing logout endpoints
+Why this edit was made:
+verifyCSRFToken() reads $_SESSION['csrf_token'], which is null when the session has expired or been invalidated by session_regenerate_id(true). Since hash_equals(null, $token) always returns false, users with expired sessions were permanently locked out of logging out — the CSRF check blocked the very action that destroys the session.
+The fix applies the principle that if there is no active login, the user is already logged out — CSRF validation is meaningless (there's no session to protect), so the logout should succeed. CSRF is still strictly enforced when an active session exists, preventing CSRF-based forced-logout attacks.
+Additionally, no-clubs.php and super-owner-dashboard.php were calling api/auth.php?action=logout while app.js (used in index.php) called logout.php. These two endpoints had divergent logic (auth.php lacked session cookie cleanup and session_unset()). All callers now use the canonical logout.php endpoint, and auth.php's logout block was updated to mirror logout.php's full cleanup logic as a backward-compatible fallback for any cached pages or bookmarks.
+
+Title: Fix #3 — Eliminate redundant session_start(), replace raw $pdo with helpers, prevent malformed output on DB failure
+Why this edit was made:
+Three related problems existed in the index.php → loadUserData.php chain:
+
+Redundant session_start(): index.php called session_start() before requiring db.php, which also calls session_start() (with a guard). While the guard makes the second call a no-op in most cases, removing the first call from index.php makes db.php the single authoritative owner of session initialization, eliminating any risk of conflicts with custom session handlers or edge-case corruption.
+Malformed output on DB failure: If db.php's database connection failed, it called die(json_encode(...)), outputting raw JSON to the browser on what should be an HTML page. Adding ob_start() in index.php ensures any premature die() output is buffered and can be caught, while all redirect paths call ob_end_clean() to discard the buffer before sending Location headers.
+Raw $pdo usage in loadUserData.php: The file used $pdo->prepare()/execute()/fetch() directly instead of the dbQueryOne()/dbQuery() helpers from db.php. This bypassed the helpers' reconnection logic (via getDBConnection()), consistent error logging, and meant a MySQL timeout between db.php init and query execution would crash with an unhandled exception. The catch block used die("An error occurred...") which output plain text into a partially-buffered HTML document. All queries now use the helpers, and the catch block redirects to login.php?error=db for a clean user experience. A safety fallback was also added for the $activeClub lookup to prevent null reference errors if active_club_id somehow doesn't match any club.
